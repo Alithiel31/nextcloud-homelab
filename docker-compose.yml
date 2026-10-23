@@ -1,0 +1,113 @@
+# Nextcloud (préparé, NON déployé). Postgres natif mutualisé, Redis dédié, accès Tailscale uniquement.
+# Schéma d'exposition identique à Mailpit/Homepage : rien sur 0.0.0.0.
+services:
+  nextcloud:
+    # TODO : vérifier la dernière version majeure stable, puis figer le digest après le premier pull
+    # docker image inspect nextcloud:<version>-apache --format '{{index .RepoDigests 0}}'
+    image: nextcloud:${NEXTCLOUD_VERSION:-32}-apache
+    container_name: nextcloud
+    labels:
+      - "homelab.tier=app"
+      - "traefik.enable=true"
+      - "traefik.http.routers.nextcloud.entrypoints=internal"
+      - "traefik.http.routers.nextcloud.rule=Host(`cloud.caesura.internal`)"
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+    restart: unless-stopped
+    depends_on:
+      - redis
+    networks:
+      - default
+      - traefik-net
+    # Localhost + IP Tailscale uniquement.
+    ports:
+      - "127.0.0.1:${NEXTCLOUD_PORT:-8180}:80"
+      - "${TAILSCALE_IP:?TAILSCALE_IP manquant dans .env}:${NEXTCLOUD_PORT:-8180}:80"
+    environment:
+      # Base : Postgres natif de Caesura (pas de conteneur Postgres dédié)
+      - POSTGRES_HOST=host.docker.internal:5432
+      - POSTGRES_DB=nextcloud
+      - POSTGRES_USER=nextcloud_app
+      - POSTGRES_PASSWORD=${NEXTCLOUD_DB_PASS:?NEXTCLOUD_DB_PASS manquant (Infisical ou .env)}
+      # Cache / verrouillage de fichiers
+      - REDIS_HOST=redis
+      # Compte admin créé à la première installation
+      - NEXTCLOUD_ADMIN_USER=${NEXTCLOUD_ADMIN_USER:-admin}
+      - NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD:?NEXTCLOUD_ADMIN_PASSWORD manquant (Infisical ou .env)}
+      # Hôtes autorisés : nom interne, nom Tailscale, IP Tailscale, localhost
+      - NEXTCLOUD_TRUSTED_DOMAINS=cloud.caesura.internal ${TS_HOST:?TS_HOST manquant dans .env}:${NEXTCLOUD_PORT:-8180} ${TAILSCALE_IP}:${NEXTCLOUD_PORT:-8180} localhost:${NEXTCLOUD_PORT:-8180}
+      # Traefik est sur traefik-net (plage Docker) : à faire confiance pour X-Forwarded-*
+      - TRUSTED_PROXIES=172.16.0.0/12
+      - OVERWRITEPROTOCOL=http
+      # Mails (reset de mot de passe…) : Mailpit mutualisé, sans auth ni TLS
+      - SMTP_HOST=${SMTP_HOST:?SMTP_HOST manquant dans .env}
+      - SMTP_PORT=${SMTP_PORT:-1025}
+      - MAIL_FROM_ADDRESS=nextcloud
+      - MAIL_DOMAIN=caesura.local
+      # PHP
+      - PHP_MEMORY_LIMIT=512M
+      - PHP_UPLOAD_LIMIT=${PHP_UPLOAD_LIMIT:-4G}
+      - TZ=Europe/Paris
+    extra_hosts:
+      - "host.docker.internal:172.27.30.1"
+    volumes:
+      - nextcloud-html:/var/www/html
+      # Données sur le disque (l'espace libre de la SD est limité), pas sur la SD
+      - "${DATA_PATH:?DATA_PATH manquant dans .env}:/var/www/html/data"
+      # Dossiers du disque, en lecture seule : à exposer via l'app « Stockage externe » (type Local) → /mnt/disque/*
+      # (on ne monte pas tout /mnt/storage : il contient docker, backups, swapfile…)
+      - "${DISK_DOCUMENTS:?DISK_DOCUMENTS manquant dans .env}:/mnt/disque/Documents:ro"
+      - "${DISK_MUSIC:?DISK_MUSIC manquant dans .env}:/mnt/disque/Musiques:ro"
+      - "${DISK_PHOTOS:?DISK_PHOTOS manquant dans .env}:/mnt/disque/Photos:ro"
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+
+  # Tâches de fond (toutes les 5 min) : même image, même volumes
+  nextcloud-cron:
+    image: nextcloud:${NEXTCLOUD_VERSION:-32}-apache
+    container_name: nextcloud-cron
+    labels:
+      - "homelab.tier=app"
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    depends_on:
+      - nextcloud
+    environment:
+      - TZ=Europe/Paris
+    extra_hosts:
+      - "host.docker.internal:172.27.30.1"
+    volumes:
+      - nextcloud-html:/var/www/html
+      # Données sur le disque (l'espace libre de la SD est limité), pas sur la SD
+      - "${DATA_PATH:?DATA_PATH manquant dans .env}:/var/www/html/data"
+      - "${DISK_DOCUMENTS}:/mnt/disque/Documents:ro"
+      - "${DISK_MUSIC}:/mnt/disque/Musiques:ro"
+      - "${DISK_PHOTOS}:/mnt/disque/Photos:ro"
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+
+  redis:
+    image: redis:7-alpine  # TODO : figer le digest
+    container_name: nextcloud-redis
+    labels:
+      - "homelab.tier=app"
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "48mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+
+volumes:
+  nextcloud-html:
+
+networks:
+  default:
+    ipam:
+      config:
+        # Sous-réseau dédié (à ouvrir dans pg_hba.conf + ufw). Vérifier qu'il n'est pas déjà pris :
+        # docker network inspect $(docker network ls -q) --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'
+        - subnet: 172.27.30.0/24
+          gateway: 172.27.30.1
+  traefik-net:
+    external: true

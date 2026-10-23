@@ -1,0 +1,15 @@
+.env
+.infisical-identity.env
+
+# Notes privées avec infos d'infra réelles (Tailscale, hostnames) — jamais commitées
+NOTES-*.md
+
+*.bak*
+*.log
+
+# OS / editeur
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
